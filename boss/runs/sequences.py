@@ -578,10 +578,10 @@ class Scoring:
         :return: Tuple of strategy and threshold of acceptance
         """
         # take downsampling into consideration
-        alpha = 300 // window
-        rho = 300 // window
-        mu = 400 // window
-        tc = time_cost // window
+        alpha = 300 / window
+        rho = 300 / window
+        mu = 400 / window
+        tc = time_cost / window
         # group benefit into bins of similar values
         # using binary exponent
         benefit_flat = benefit.flatten('F')
