@@ -8,7 +8,6 @@ from numpy.typing import NDArray
 import bottleneck as bn
 import mappy
 
-from boss.utils import window_sum, adjust_length
 from boss.mapper import Indexer
 from boss.runs.sequences import Scoring
 
@@ -35,6 +34,7 @@ class Contig:
         self.barcodes = barcodes
         self.nbarcodes = len(barcodes) if barcodes is not None else 1
         self.window_size = window_size
+        self.n_windows = -(-self.length // window_size)
         self.seq_int = self._seq2int()
         self._init_coverage()
         self._init_buckets()
@@ -90,7 +90,11 @@ class Contig:
         :return:
         """
         self.bucket_size = bucket_size
-        self.bucket_switches = np.zeros(shape=(int(self.length // bucket_size) + 1, self.nbarcodes), dtype="bool")
+        # the remainder of the contig is folded into the last bucket
+        n_buckets = max(1, self.length // bucket_size)
+        self.bucket_starts = np.arange(n_buckets) * bucket_size
+        self.bucket_lengths = np.append(np.diff(self.bucket_starts), self.length - self.bucket_starts[-1])
+        self.bucket_switches = np.zeros(shape=(n_buckets, self.nbarcodes), dtype="bool")
         self.switched_on = np.zeros(shape=(self.nbarcodes), dtype="bool")
 
 
@@ -116,7 +120,7 @@ class Contig:
         if self.rej:
             self.strat = np.zeros(dtype="bool", shape=1)  # NOTE: If 'reject by default' can be barcode specific, add another dimension here
         else:
-            self.strat = np.ones(dtype="bool", shape=(self.length // self.window_size, 2, self.nbarcodes))
+            self.strat = np.ones(dtype="bool", shape=(self.n_windows, 2, self.nbarcodes))
 
 
 
@@ -195,10 +199,9 @@ class Contig:
             bucket_switches = self.bucket_switches[:,b]
 
             csum = np.sum(coverage, axis=1)
-            # coverage in buckets
-            csum_buckets = window_sum(csum, self.bucket_size)
-            cmean_buckets = np.divide(csum_buckets, self.bucket_size)
-            cmean_buckets = adjust_length(original_size=bucket_switches.shape[0], expanded=cmean_buckets)
+            # mean coverage in buckets, the last bucket also covers the remainder of the contig
+            csum_buckets = np.add.reduceat(csum, self.bucket_starts)
+            cmean_buckets = np.divide(csum_buckets, self.bucket_lengths)
             # flip strategy switches
             bucket_switches[np.where(cmean_buckets >= threshold)] = 1
             switch_count = np.bincount(bucket_switches)
@@ -222,24 +225,18 @@ class Contig:
         """
         # NOTE: Can in the future vectorise this function fully
         # assign smu as attribute
-        self.smu = np.zeros(shape=(int(self.length // self.window_size) + 1, 2, self.nbarcodes))
+        self.smu = np.zeros(shape=(self.n_windows, 2, self.nbarcodes))
         # downsample the scores
-        self.scores_ds = np.zeros(shape=(int(self.length // self.window_size) + 1, self.nbarcodes))
+        self.scores_ds = np.zeros(shape=(self.n_windows, self.nbarcodes))
         for b in range(0, self.nbarcodes):
             site_indices = np.arange(0, self.length) // self.window_size
             # avoid buffering
             np.add.at(self.scores_ds[:,b], site_indices, self.scores[:,b])
             # calculate smu - fwd needs double reversal due to how bn.move_sum() operates
-            if mu // self.window_size == 0:
-                w = 1
-            else:
-                w = mu // self.window_size
-            try:
-                smu_fwd = bn.move_sum(self.scores_ds[::-1,b], window=w, min_count=1)[::-1]
-                smu_rev = bn.move_sum(self.scores_ds[:,b], window=w, min_count=1)
-            except ValueError:
-                smu_fwd = bn.move_sum(self.scores_ds[::-1,b], window=self.scores_ds.shape[0]-1, min_count=1)[::-1]
-                smu_rev = bn.move_sum(self.scores_ds[:,b], window=self.scores_ds.shape[0]-1, min_count=1)
+            # clamp window to [1, n_windows]: at least one window, at most the whole contig
+            w = min(max(mu // self.window_size, 1), self.scores_ds.shape[0])
+            smu_fwd = bn.move_sum(self.scores_ds[::-1,b], window=w, min_count=1)[::-1]
+            smu_rev = bn.move_sum(self.scores_ds[:,b], window=w, min_count=1)
 
             self.smu[:, 0, b] = smu_fwd
             self.smu[:, 1, b] = smu_rev
@@ -263,12 +260,10 @@ class Contig:
             # temporary container
             tmp_benefit = np.zeros(shape=(self.scores_ds.shape[0], 2))
             for i in range(10):
-                try:
-                    b_part_fwd = bn.move_sum(self.scores_ds[::-1, b], window=int(approx_ccl_ds[i]), min_count=1)[::-1]
-                    b_part_rev = bn.move_sum(self.scores_ds[:, b], window=int(approx_ccl_ds[i]), min_count=1)
-                except ValueError:
-                    b_part_fwd = bn.move_sum(self.scores_ds[::-1, b], window=self.scores_ds.shape[0]-1, min_count=1)[::-1]
-                    b_part_rev = bn.move_sum(self.scores_ds[:, b], window=self.scores_ds.shape[0]-1, min_count=1)
+                # clamp window to [1, n_windows]: at least one window, at most the whole contig
+                w = min(max(int(approx_ccl_ds[i]), 1), self.scores_ds.shape[0])
+                b_part_fwd = bn.move_sum(self.scores_ds[::-1, b], window=w, min_count=1)[::-1]
+                b_part_rev = bn.move_sum(self.scores_ds[:, b], window=w, min_count=1)
                 # apply weighting by length
                 wgt = mult[i]
                 tmp_benefit[:, 0] += (b_part_fwd * wgt)

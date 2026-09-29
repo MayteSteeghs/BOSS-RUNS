@@ -202,32 +202,6 @@ def window_sum(arr: NDArray, w: int) -> NDArray:
     return sumw
 
 
-
-def adjust_length(original_size: int, expanded: NDArray) -> NDArray:
-    """
-    Adjust the size of an array after expanding during downsampling
-
-    :param original_size: Target size of expanded array
-    :param expanded: Input array after expansion
-    :return: Adjusted input array
-    """
-    # after expanding arrays from binning
-    lendiff = original_size - expanded.shape[0]  # TODO: Verify whether this one still works with barcodes
-    if lendiff > 0:
-        # original is longer than replacement
-        repl = np.append(expanded, expanded[-lendiff:], axis=0)  # TODO: These might need to change with additional dimension for barcode
-    elif lendiff < 0:
-        # original is shorter than replacement
-        repl = expanded[: -abs(lendiff)]  # TODO: These might need to change with additional dimension for barcode, this one is likely not okay
-    else:
-        repl = expanded
-
-    assert repl.shape[0] == original_size
-    return repl
-
-
-
-
 def search_running_process(processName: str) -> bool:
     '''
     Check if there is any running process that contains the given name processName.
