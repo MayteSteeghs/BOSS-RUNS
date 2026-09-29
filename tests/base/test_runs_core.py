@@ -45,7 +45,8 @@ def test__init_dummy_strats(BossRuns, modes):
     BossRuns.init()
     strat_dict = BossRuns.ref.get_strategy_dict()
     assert len(strat_dict) == 9
-    assert strat_dict["NZ_CP041015.1"].shape == (4045619 // 100, 2, BossRuns.nbarcodes)
+    ws = BossRuns.args.optional.window_size
+    assert strat_dict["NZ_CP041015.1"].shape == (-(-4045619 // ws), 2, BossRuns.nbarcodes)
     # test _write_contig_strategies (run during init)
     assert (Path(BossRuns.out_dir) / "masks" / "boss.npz").is_file()
 

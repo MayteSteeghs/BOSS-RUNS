@@ -11,7 +11,6 @@ from boss.runs.abundance_tracker import AbundanceTracker
 from boss.runs.readstartdist import ReadStartDist
 from boss.runs.reference import Reference
 from boss.runs.sequences import CoverageConverter, Scoring
-from boss.utils import adjust_length
 
 
 class BossRuns(Boss):
@@ -128,13 +127,14 @@ class BossRuns(Boss):
         """
         i = 0
         for cname, cont in self.contigs_filt.items():
-            # get the buckets of this contig and expand
-            expand_fac = cont.bucket_size // self.args.optional.window_size
-            buckets_exp = np.repeat(cont.bucket_switches, expand_fac, axis=0)
-            buckets = adjust_length(original_size=cont.strat.shape[0], expanded=buckets_exp)
+            # get the bucket of each decision window by its start position,
+            # the remainder of the contig belongs to the last bucket
+            window_starts = np.arange(cont.n_windows) * self.args.optional.window_size
+            bucket_idx = np.minimum(window_starts // cont.bucket_size, cont.bucket_switches.shape[0] - 1)
+            buckets = cont.bucket_switches[bucket_idx]
             assert buckets.shape[0] == cont.strat.shape[0]
             # grab the new strategy
-            cstrat = strat[i: i + cont.length // self.args.optional.window_size, :]
+            cstrat = strat[i: i + cont.n_windows, :]
             assert cstrat.shape == cont.strat.shape
             # assign new strat
             if not self.args.general.barcodes:
@@ -148,7 +148,7 @@ class BossRuns(Boss):
             f_perc = np.count_nonzero(cont.strat[:, 0]) / cont.strat.shape[0]
             r_perc = np.count_nonzero(cont.strat[:, 1]) / cont.strat.shape[0]
             logging.info(f'{cname}: {f_perc}, {r_perc}') # NOTE: Maybe think about whether this log is confusing because it can report more sites than exist with barcodes
-            i += cont.length // self.args.optional.window_size
+            i += cont.n_windows
 
 
 
@@ -171,20 +171,16 @@ class BossRuns(Boss):
             fhat_exp = np.repeat(fhat_exp[:, :, np.newaxis], self.nbarcodes, axis=2)
             self._update_benefits()
             # merge the benefits into one array for combined calculation
-            benefit, _smu = self.scoring.merge_benefit(self.contigs_filt)
-            target_size = self.ref.n_sites // self.args.optional.window_size
-            benefit_adj = adjust_length(original_size=target_size,
-                                        expanded=benefit)
-            smu_adj = adjust_length(original_size=target_size,
-                                        expanded=benefit)
-            fhat_adj = adjust_length(original_size=target_size,
-                                     expanded=fhat_exp)
-            assert fhat_adj.shape == benefit_adj.shape == smu_adj.shape
+            benefit, smu = self.scoring.merge_benefit(self.contigs_filt)
+            # all arrays hold one row per decision window of the contigs
+            target_size = sum(cont.n_windows for cont in self.contigs_filt.values())
+            assert benefit.shape == smu.shape == fhat_exp.shape
+            assert benefit.shape[0] == target_size
             # find the current decision strategy
             strat, _threshold = self.scoring.find_strat_thread(
-                benefit=benefit_adj,
-                smu=smu_adj,
-                fhat=fhat_adj,
+                benefit=benefit,
+                smu=smu,
+                fhat=fhat_exp,
                 time_cost=self.rl_dist.time_cost,
                 window = self.args.optional.window_size
             )

@@ -10,23 +10,34 @@ from boss.paf import Paf
 
 class ReadStartDist:
 
-    def __init__(self, contigs: dict, window_size: int = 2000, alpha: float = 1.0, p0: float = 0.1):
+    def __init__(self, contigs: dict, windows_per_bin: int | None = None, alpha: float = 1.0, p0: float = 0.1):
         """
         Initialise the probability distribution of fragment start sites
 
         :param contigs: Dictionary of contig objects
-        :param window_size: Window size of counting read starts
+        :param windows_per_bin: Number of decision windows per bin of counting read starts.
         :param alpha: prior for alpha (hyperparameter for dirichlet prior)
         :param p0: Prior for sites with 0 observations
         """
         self.alpha = alpha
         self.p0 = p0
-        self.window_size = window_size
-        # track read start positions (forward and rev) in windows
-        self.read_starts = {cname : np.zeros(shape=(int(c.length / window_size), 2)) for cname, c in contigs.items()}  # NOTE: No additional dimension for barcodes in this initial implementation
+        # size of the decision windows of the strategy, the same for all contigs
+        self.decision_window = next(iter(contigs.values())).window_size
+        self.windows_per_bin = windows_per_bin or max(1, round(2000 / self.decision_window))
+        # number of decision windows per contig, fhat is expanded to exactly these
+        self.n_windows = {cname: c.n_windows for cname, c in contigs.items()}
+        # number of decision windows in each bin. The remainder of a contig is folded into its last bin
+        self.bin_windows = {}
+        for cname, c in contigs.items():
+            n_bins = max(1, c.n_windows // self.windows_per_bin)
+            bin_windows = np.full(n_bins, self.windows_per_bin)
+            bin_windows[-1] = c.n_windows - (n_bins - 1) * self.windows_per_bin
+            self.bin_windows[cname] = bin_windows
+        # track read start positions (forward and rev) in bins of windows_per_bin decision windows
+        self.read_starts = {cname : np.zeros(shape=(self.bin_windows[cname].shape[0], 2)) for cname in contigs.keys()}  # NOTE: No additional dimension for barcodes in this initial implementation
         # fhat exists only in its merged form, i.e. for use in updating on a merged array
         self.total_len = np.sum([a.shape[0] for a in self.read_starts.values()])
-        self.target_size = int(np.sum([c.length for c in contigs.values()]) // 100)
+        self.target_size = int(np.sum([c.n_windows for c in contigs.values()]))
         self.on_target = 1   # TODO
         self.fhat = self.update_f_pointmass()
 
@@ -43,7 +54,8 @@ class ReadStartDist:
     def count_read_starts(self, paf_dict: dict[str, list]) -> None:
         """
         Keep track of the read starting positions C_{i,o}, used to update F
-        Read starts are saved in non-overlapping windows of windowsize
+        Read starts are saved in non-overlapping bins of windows_per_bin decision windows,
+        the last bin of a contig also holds the remaining windows
 
         :param paf_dict: Dictionary of read mappings
         :return:
@@ -65,21 +77,18 @@ class ReadStartDist:
             else:
                 starts_fwd[rec.tname].append(rec.tstart)
 
-        for cname, r_starts in self.read_starts.items():
-            # count the number of read starts in windows
-            n_windows = int(r_starts.shape[0])
-            bins_fwd = np.histogram(
-                starts_fwd[cname],
-                bins=n_windows,
-                range=(0, self.window_size * n_windows))[0].astype(dtype='float')
-            bins_rev = np.histogram(
-                starts_rev[cname],
-                bins=n_windows,
-                range=(0, self.window_size * n_windows))[0].astype(dtype='float')
-
-            # add new counts to the array
-            self.read_starts[cname][:, 0] += bins_fwd
-            self.read_starts[cname][:, 1] += bins_rev
+        # only contigs with new read starts need updating
+        for cname in (starts_fwd.keys() | starts_rev.keys()) & self.read_starts.keys():
+            r_starts = self.read_starts[cname]
+            n_bins = int(r_starts.shape[0])
+            for strand, starts in enumerate((starts_fwd[cname], starts_rev[cname])):
+                # decision window each read start falls into, ignoring positions outside of the contig
+                windows = np.asarray(starts, dtype=int) // self.decision_window
+                windows = windows[(windows >= 0) & (windows < self.n_windows[cname])]
+                # count the number of read starts in bins, the remaining windows belong to the last bin
+                bins = np.minimum(windows // self.windows_per_bin, n_bins - 1)
+                # add new counts to the array
+                r_starts[:, strand] += np.bincount(bins, minlength=n_bins)
 
 
 
@@ -92,54 +101,53 @@ class ReadStartDist:
         """
         # concatenate arrays
         merged = self.merge()
-        n_windows = merged.shape[0]
         fhat = np.zeros(shape=merged.shape)
+        # dirichlet parameter of each bin, weighted by the number of decision windows it holds
+        bin_windows = np.concatenate(list(self.bin_windows.values()))
+        alphas = np.repeat((self.alpha * bin_windows / self.windows_per_bin)[:, np.newaxis], 2, axis=1)
+        # equals 2 * n_bins * alpha if all bins are full
+        alpha_sum = np.sum(alphas)
         # First, sites with C > 0
         nonzero_indices = np.nonzero(merged)
         nonzero = merged[nonzero_indices]
-        num = np.add(self.alpha, nonzero)
+        num = np.add(alphas[nonzero_indices], nonzero)
         Csum = np.sum(nonzero)
-        denom = 2 * n_windows * self.alpha + Csum
+        denom = alpha_sum + Csum
         fhat[nonzero_indices] = np.divide(num, denom)
         # then sites with C == 0
-        rhs = (self.alpha / (2 * n_windows * self.alpha + Csum))
-        beta_num = np.exp(betaln(self.alpha, ((2 * n_windows - 1) * self.alpha + Csum)))
-        beta_denom = np.exp(betaln(self.alpha, ((2 * n_windows - 1) * self.alpha))) or 1e-20
-        p0_bit = self.p0 / (self.p0 + (1 - self.p0) * (beta_num / beta_denom))
+        rhs = (alphas / (alpha_sum + Csum))
+        # ratio of beta functions (Suppl. Eq. S.24), calculated in log space to avoid underflow
+        beta_num = betaln(alphas, (alpha_sum - alphas + Csum))
+        beta_denom = betaln(alphas, (alpha_sum - alphas))
+        p0_bit = self.p0 / (self.p0 + (1 - self.p0) * np.exp(beta_num - beta_denom))
         lhs = 1 - p0_bit
         expectedPost = lhs * rhs
         # mask for the zero count sites - derived from nonzero indices
         zero_indices = np.ones(shape=fhat.shape, dtype="bool")
         zero_indices[nonzero_indices] = 0
-        fhat[zero_indices] = expectedPost
+        fhat[zero_indices] = expectedPost[zero_indices]
         # expand from downsampled size
         fhat_exp = self._expand_fhat(fhat)
         return fhat_exp
 
 
 
-    def _expand_fhat(self, fhat, downsample_window: int = 100) -> NDArray:
+    def _expand_fhat(self, fhat: NDArray) -> NDArray:
         """
-        Expand and normalise Fhat from the compacted length of genome_length / windowSize
+        Expand and normalise Fhat from bins to the decision windows of each contig.
 
-        :param fhat: probabilities of read starting positions
-        :param downsample_window: length of windows used in generating decision strategies
-        :return: read start probs expanded from genome_length / windowSize
+        :param fhat: probabilities of read starting positions in bins, merged across contigs
+        :return: read start probs in decision windows, merged across contigs
         """
-        nrep = int(self.window_size // downsample_window)
-        # expand to the downsampled size
-        fhat_exp = np.repeat(fhat, nrep, axis=0)
-        # correct for small length difference
-        lendiff = self.target_size - fhat_exp.shape[0]
-        assert lendiff < self.window_size
-        if lendiff > 0:
-            # genome is longer than Fhat
-            fhat_exp = np.append(fhat_exp, fhat_exp[-lendiff:], axis=0)
-        elif lendiff < 0:
-            # genome is shorter than Fhat
-            fhat_exp = fhat_exp[:-abs(lendiff)]
-        else:
-            pass
+        fhat_parts = []
+        offset = 0
+        for bin_windows in self.bin_windows.values():
+            n_bins = bin_windows.shape[0]
+            fhat_c = fhat[offset: offset + n_bins] / bin_windows[:, np.newaxis]
+            fhat_parts.append(np.repeat(fhat_c, bin_windows, axis=0))
+            offset += n_bins
+        fhat_exp = np.concatenate(fhat_parts)
+        assert fhat_exp.shape[0] == self.target_size
 
         # normalise only if not empty
         fhat_sum = np.sum(fhat_exp)
@@ -160,6 +168,7 @@ class ReadStartDist:
 
         :return: Prior of dirichlet and proportion of gap sites
         """
+        # TODO: scale priors to bin sizes
         merged = self.merge()
         n_windows = merged.shape[0]
         # filter readStartCounts for positions with 0
