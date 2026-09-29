@@ -105,8 +105,8 @@ class ReadStartDist:
         rhs = (self.alpha / (2 * n_windows * self.alpha + Csum))
         beta_num = np.exp(betaln(self.alpha, ((2 * n_windows - 1) * self.alpha + Csum)))
         beta_denom = np.exp(betaln(self.alpha, ((2 * n_windows - 1) * self.alpha))) or 1e-20
-        p0_bit = self.p0 / (self.p0 + (1 - self.p0))
-        lhs = 1 - p0_bit * (beta_num / beta_denom)
+        p0_bit = self.p0 / (self.p0 + (1 - self.p0) * (beta_num / beta_denom))
+        lhs = 1 - p0_bit
         expectedPost = lhs * rhs
         # mask for the zero count sites - derived from nonzero indices
         zero_indices = np.ones(shape=fhat.shape, dtype="bool")
